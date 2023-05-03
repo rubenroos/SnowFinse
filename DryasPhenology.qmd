@@ -1,27 +1,474 @@
 ---
 title: "SnowFinse - Dryas phenology"
 author: "Ruben Erik Roos"
-format: html
 editor: visual
+format:
+  html:
+    embed-resources: true
+    fig-width: 10
+    fig-height: 7
 ---
 
-## Quarto
+## About this document
 
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+This site presents code to produce figures and analyses as reported by Roos et al., A year without summer: how mid-summer cold affects flowering phenology and reduces seed production of Dryas octopetala.
 
-## Running Code
+It includes scripts for data analyses of climate data recorded at the official weather stations at Finse (Norway), microclimate data recorded at Mt. Sanddalsnuten (Finse, Norway), and phenological data on Dryas octopetala collected with time-lapse cameras at Mt. Sanddalsnuten.
 
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+## Load packages
 
-```{r}
-1 + 1
-```
-
-You can add options to executable code like this
+Load required packages.
 
 ```{r}
-#| echo: false
-2 * 2
+#| warning: false
+library(tidyverse)
+library(zoo)
+library(dplyr)
+library(cowplot)
+library(readr)
+library(viridis)
+
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+## Load datafiles
+
+Climate and weather data from Finse are publicly availabe at: seklima.met.no
+
+```{r}
+#| warning: false
+
+#Load the data required for the July temperature analyses for the Finse weather stations.
+temp_july<- read.csv("Data/July_temperatures_Finse.csv", sep = ";", header = TRUE)
+
+#Load the data required for daily temperature analyses
+temp_daily <- read.csv("Data/All_weather_parameters_Finse2.csv", sep = ";", header = TRUE)
+
+#Load all dates for temperature recordings (dates without data are not printed by the seklima.met.no database)
+all_dates <- read.csv("Data/All_dates_Finse.csv", sep = ";", header = TRUE)
+
+
+#Load the seed count data
+df_seed<- readxl::read_xlsx("Data/2020_Dryas flowering and seed set.xlsx")
+
+
+```
+
+## July temperature analysis
+
+```{r}
+#| warning: false
+#| label: fig-julytemps
+#| fig-cap: "Maximum daily, minimum daily, and monthly mean temperatures for July at Finse, Norway"
+
+#Convert data to long format 
+temp_july_long <- gather(temp_july, variable, temperature, TAM_july:TAX_july, factor_key=TRUE)
+temp_july_long$variable <- factor(temp_july_long$variable, levels = c("TAX_july", "TAM_july", "TAN_july"))
+
+#Create plot
+p.july <- ggplot(temp_july_long, aes(x = Year, y = temperature, col = variable)) +
+  geom_hline(yintercept = 0, linetype = "dashed")+ 
+  geom_point(size= 2) +
+  geom_line(linewidth = 1.5)+
+  geom_line(data = filter(temp_july_long, is.na(temperature)==FALSE), linetype = "dotted", linewidth = 1.5) +
+  scale_color_manual(values=c('#55C667FF', '#404788FF', '#FDE725FF'), labels = c( "Highest daily maximum","Monthly average", "Lowest daily minimum"))+
+  theme_classic()+
+  theme(legend.position="bottom") +
+  theme(legend.title = element_blank()) +
+  xlab(expression("Year"))+
+  ylab(expression("Temperature (\u00b0C)"))+
+  theme(text = element_text(size=18))
+
+p.july
+
+```
+
+
+## Daily temperature analyses: calculating yearly thawing degree days
+
+First, we need to clean the data somewhat.
+
+```{r}
+
+all_dates <- all_dates %>% 
+  mutate(Date=as.Date(Date, format = "%d.%m.%Y")) #converts to proper date format
+temp_daily <- temp_daily %>% 
+  mutate(Date=as.Date(Date, format = "%d.%m.%Y")) #converts to proper date format 
+
+
+#Now join to the dataframe with all dates
+
+temp_daily <- all_dates %>% left_join(., temp_daily, by = "Date")
+
+
+#Data format and prep
+temp_daily <- temp_daily %>% 
+  mutate(Year = as.numeric(format(Date,'%Y')))%>% #adds column with year
+  mutate(Month = as.numeric(format(Date, '%m'))) %>% #adds column with month
+  mutate(Jday = as.numeric(format(Date, '%j'))) %>% #adds column with Julian day (day of year)
+  mutate(RR = "is.na<-"(RR, RR < 0)) %>% #convert missing or negative precipitation to NA
+  mutate(TAM = "is.na<-"(TAM, TAM == -99.9), TAN = "is.na<-"(TAN, TAN == -99.9), TAX = "is.na<-"(TAX, TAX == -99.9)) %>% #convert missing TAM, TAN, and TAX to NA. 
+  mutate(TAM = "is.na<-"(TAM, TAM =="-"), TAN = "is.na<-"(TAN, TAN == "-"), TAX = "is.na<-"(TAX, TAX == "-"), RR = "is.na<-"(RR, RR == "-")) %>% #recently, missing values have been reported as "-" by seklima, this line converts also those to NA
+  mutate(TAM = as.numeric(TAM), TAN = as.numeric(TAN), TAX = as.numeric(TAX), RR = as.numeric(RR))
+
+
+#Where the daily average is missing, we can substitute by the average of the daily minimum and maximum, if these values are available. 
+temp_daily <- temp_daily %>% 
+  mutate(TAM= ifelse(is.na(TAM), (TAN+TAX)/2, TAM))
+
+```
+
+Because some years are missing a lot of data, we have to remove these years. In this case, if more than ten days have missing data for daily average temperature, that year is removed from the dataset. 
+
+```{r}
+complete_season_TDD10 <- temp_daily %>% 
+  group_by(Year) %>% 
+  dplyr::summarise(count = sum(!is.na(TAM))) %>% 
+  filter(count >=355) %>% 
+  pull(Year) #here we select the years that have sufficient data
+
+temp_daily_year10 <-  temp_daily%>%
+  filter(Year %in% complete_season_TDD10)# here is where select only the complete seasons
+
+#This removed years 1969, 1982, 1991, 1992, 1994-2002, and 2017
+
+TDD_yearly_summed <- temp_daily_year10 %>% 
+  group_by(Year) %>%
+  mutate(TDD = if_else(TAM >= 0, TAM-0, 0)) %>% 
+  dplyr::summarize(TDD_sum = sum(TDD, na.rm = TRUE)) #calculates thawing degree days per year
+
+
+```
+
+
+Calculate which years are outliers
+```{r}
+
+TDD_yearly_summary <- TDD_yearly_summed %>% 
+  summarise_at(vars(TDD_sum),
+               list(min=min, 
+                    Q1=~quantile(., probs = 0.25),
+                    median=median,
+                    mean=mean, 
+                    Q3=~quantile(., probs = 0.75),
+                    max=max, 
+                    IQR = IQR,
+                    upper_limit = ~quantile(., probs = 0.75) + 1.5 * IQR, 
+                    lower_limit = ~quantile(., probs = 0.25)- 1.5 * IQR,
+                    sd = ~sd(.), 
+                    se = ~sd(./sqrt(.))))
+
+TDD_yearly_summary 
+
+
+```
+
+
+
+We can now make figures
+
+```{r}
+
+#| warning: false
+#| label: fig-julytemps
+#| fig-cap: "Yearly accumulated thawing degree days at Finse, Norway. Note that data collected between 1969 and 1992 and after 2004 are collected from different weather stations, see Roos et al. 2022. The theoretical completion of seed set is based on Semenchuck et al. 2016"
+#|fig-width: 10
+#|fig-height: 8
+
+#Create plot
+
+p.yearly.tdd <- ggplot(data = TDD_yearly_summed, aes(x = Year, y = TDD_sum))+
+  geom_point() +
+  geom_hline(yintercept=450, linetype = "dashed")+
+  theme_classic()+
+  labs(y = "Accumulated yearly TDD", x = "Year")+
+  theme(text = element_text(size=18), axis.title.x=element_blank()) + 
+  annotate("text", x = 1982, y = 475, label = "Theoretical completion of seed set", fontface= "italic")+
+  scale_y_continuous(expand = c(0, 0), limits = c(400, 1300))
+
+#create accompanying boxplot
+
+p.yearly.tdd.box <- ggplot(data = TDD_yearly_summed, aes(x=factor(0), y = TDD_sum)) +
+  stat_boxplot(geom = 'errorbar', width = 0.2)+
+  geom_boxplot() +
+  theme_classic()+
+  labs(x = "", y = "") +
+  theme(axis.ticks.x=element_blank(), axis.text.x=element_blank(), axis.title.y=element_blank(), text = element_text(size = 18)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(400, 1300)) +
+  geom_text(data=subset(TDD_yearly_summed, TDD_sum > 1340), #1340 is the upper outlier limit as calculated above
+            aes(factor(0),TDD_sum, label=Year))
+
+#create one plot
+p.TDD.yearly <- plot_grid(p.yearly.tdd, p.yearly.tdd.box, ncol =2, rel_widths = c(1,0.33), align = "hv")
+p.TDD.yearly
+
+```
+
+
+## Daily temperature analyses: calculating frost events and thawing degree days
+
+Before further analyses of thawing degree days and frost events, we need to explore and clean some aspects of the data. For example, we are not interested in frost cycles or potential thawing degree days that occurred during warm days mid-winter or late in autumn, as Dryas will be inactive underneath the snow or undergone scenescence. We therefore subset the data to the potential growing season. Here, we define the start of the potential growing season as the first day after which at least five consecutive days have daily average temperatures (TAM) above five degrees Celsius. The start is the last day at which TAM has been above five degrees for at least 5 days consecutively.
+
+```{r}
+
+temp_daily <- temp_daily %>%
+  group_by(Year) %>% 
+  mutate(start = rollapply(TAM > 5, 5, all, align = "left", fill = FALSE)) %>% #assigns TRUE when more than five days have TAM above zero degrees, on the first day
+  mutate(end = rollapply(TAM > 5, 5, all, align = "right", fill = FALSE)) #assigns TRUE when more than five days have TAM above zero degrees, on the last day
+
+temp_daily %>% #Calculates the earliest start of a growing season
+  filter(start == TRUE) %>%
+  group_by(Year) %>%
+  summarise(earliestDate = min(Jday)) %>% 
+  summarise(min(earliestDate)) 
+
+temp_daily %>% #Calculates the latest end of a growing season
+  filter(end == TRUE) %>%
+  group_by(Year) %>%
+  summarise(latestDate = max(Jday)) %>% 
+  summarise(max(latestDate))
+```
+
+The growing seasons are all between day 139 (May 19th) and 287 (October 14th). However, day 287 is very late in the season, and any frost so late will not affect any flowers. We therefore subset the data to April 1st (day 91) and august 1st (day 213). This ensures that we cover the flowering period. 
+
+```{r}
+temp_daily_gs <- temp_daily %>%
+  group_by(Year) %>% 
+  filter(Jday %in% (91:213)) #subsets the data to these days
+
+# Now we remove the years where more than 5 days have missing TAM data
+complete_season <- temp_daily_gs %>% 
+  group_by(Year) %>% 
+  dplyr::summarise(count = sum(!is.na(TAM))) %>% 
+  filter(count >= 123) %>% #because a full subset would have 93 data entries, minus 5 allowed missing
+  pull(Year) #selects the years that have sufficient data
+
+temp_daily_gs <- temp_daily_gs %>%
+  filter(Year %in% complete_season)# filter out the years with more than 5 missing days
+
+#This removed 1969, 1982, 1991, 1992, and 1994-2002 from the dataseries
+
+##If needed, we can calculate growing season length for each year
+#gsl <- gsl_start %>% 
+#  left_join(., gsl_end, by = "Year") %>% 
+#  mutate(length = latestDate-earliestDate+1)#length of the season in days
+
+```
+
+Now we can create some figures, let's first make a figure of Thawing degree days accumulated during the growing season for each year
+
+```{r}
+#Calculate accumulated thawing degree days before the last sharp frost
+temp_daily_fs <- temp_daily_gs %>% #Truncates the growing season data to stop at the latest frost for each year
+  group_by(Year) %>% 
+  mutate(last_frost = last(Date[TAN<=-3])) %>%  #using -3 as cutoff value
+  filter(Date <= last_frost) %>% 
+  mutate(Jday_frost = as.numeric(format(last_frost, '%j'))) 
+
+tdd_frost <- temp_daily_fs %>% #calculates the accumulated TDD before the latest frost
+  group_by(Year) %>%
+  mutate(TDD = if_else(TAM >= 0, TAM-0, 0)) %>% 
+  summarize(TDD_sum = sum(TDD, na.rm = TRUE))
+
+tdd_frost_summary <- tdd_frost %>% #calculates average, and IQR
+  summarise_at(vars(TDD_sum),
+               list(min=min, 
+                    Q1=~quantile(., probs = 0.25),
+                    median=median,
+                    mean=mean, 
+                    Q3=~quantile(., probs = 0.75),
+                    max=max, 
+                    IQR = IQR,
+                    upper_limit = ~quantile(., probs = 0.75) + 1.5 * IQR, 
+                    lower_limit = ~quantile(., probs = 0.25)- 1.5 * IQR,
+                    sd = ~sd(.), 
+                    se = ~sd(./sqrt(.))))
+
+tdd_frost_summary 
+
+
+p.frost.TDD <- ggplot(data = tdd_frost, aes(x = Year, y = TDD_sum))+
+  geom_point() +
+  geom_text(data = subset(tdd_frost, TDD_sum > 180),
+            aes(Year,TDD_sum,label=Year), 
+            position = position_stack(vjust = 1.05))  +
+  geom_hline(yintercept=180, linetype = "dashed" ) +
+  theme_classic() +
+  labs(y = "Accumulated TDD \nbefore latest frost <-3 \u00b0C") +
+  theme(text = element_text(size=18), axis.title.x=element_blank()) + 
+  annotate("text", x = 1980, y = 187, label = "Theoretical onset of flowering", fontface= "italic")+
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 255))
+
+p.frost.box <- ggplot(data = tdd_frost, aes(x=factor(0), y = TDD_sum)) +
+  stat_boxplot(geom = 'errorbar', width = 0.2)+
+  geom_boxplot() +
+  theme_classic()+
+  labs(x = "", y = "") +
+  theme(axis.ticks.x=element_blank(), axis.text.x=element_blank(), axis.title.y=element_blank(), text = element_text(size=18)) +
+  geom_text(data=subset(tdd_frost, TDD_sum > 190),#190 is the upper limit defined by 1.5 x IQR
+            aes(factor(0),TDD_sum,label=Year),
+            position = position_stack(vjust = 1.05))+
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 255))
+
+#create one plot
+p.frost <- plot_grid(p.frost.TDD, p.frost.box, ncol =2, rel_widths = c(1,0.33), align = "hv")
+p.frost
+
+```
+
+Another way to study this, is to plot the minimum temperature experiences during the longest possible, theoretical flowering season, defined by accumulated TDD sensu Semenchuck et al. 2016: between 180 and 275 TDD
+
+```{r}
+# Crop the data between day 180 and 275
+
+temp_daily_flowering <- temp_daily %>% 
+  mutate(TDD = if_else(TAM >= 0, TAM-0, 0)) %>%  #calculates TDD
+  group_by(Year) %>% 
+  mutate(TDD_sum_date = cumsum(TDD)) %>% 
+  filter(TDD_sum_date >180 & TDD_sum_date < 275) %>% 
+  group_by(Year) %>% 
+  summarize(Tn = min(TAN, na.rm = TRUE))#2005 has one missing TAN
+
+#Calculate statistics
+
+temp_flowering_summary <- temp_daily_flowering %>% 
+  summarise_at(vars(Tn),
+               list(min=min, 
+                    Q1=~quantile(., probs = 0.25),
+                    median=median,
+                    mean=mean, 
+                    Q3=~quantile(., probs = 0.75),
+                    max=max, 
+                    IQR = IQR,
+                    upper_limit = ~quantile(., probs = 0.75) + 1.5 * IQR, 
+                    lower_limit = ~quantile(., probs = 0.25)- 1.5 * IQR,
+                    sd = ~sd(.), 
+                    se = ~sd(./sqrt(.))))
+
+temp_flowering_summary
+
+#This automatically removes years (1969, 1991, 1992, etc) with missing data as cumsum(TDD) produces NA
+
+p.flowering <- ggplot(data = temp_daily_flowering, aes(x = Year, y = Tn))+
+  geom_point() +
+  geom_text(data=subset(temp_daily_flowering, Tn < -3),
+            aes(Year,Tn,label=Year), 
+            position = position_stack(vjust = -0.16)) +
+  theme_classic()+
+  geom_hline(yintercept=-3, linetype = "dashed")+
+  labs(y = "Minimum temperature (\u00b0C) \nduring flowering", x = "Year")+
+  theme(text = element_text(size=18)) + 
+  annotate("text", x = 1980, y = -2.5, label = "Theoretical damage to flowers", fontface= "italic")+
+  scale_y_continuous(expand = c(0, 0), limits = c(-7, 5))
+
+p.flowering.box <- ggplot(data = temp_daily_flowering, aes(x=factor(0), y = Tn)) +
+  stat_boxplot(geom = 'errorbar', width = 0.2)+
+  geom_boxplot() +
+  theme_classic()+
+  labs(x = "", y = "") +
+  theme(axis.ticks.x=element_blank(),axis.text.x=element_blank(), axis.title.y=element_blank(), text = element_text(size = 18)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(-7, 5))
+
+
+p.flower <- plot_grid(p.flowering, p.flowering.box, ncol =2, rel_widths = c(1,0.33), align = "hv")
+p.flower
+
+```
+Create combined figure as used in  manuscript. 
+
+```{r fig.width=10, fig.height=16}
+
+p.tdd.flowering <- plot_grid(p.yearly.tdd, p.yearly.tdd.box, p.frost.TDD, p.frost.box, p.flowering, p.flowering.box, labels = c('A','', 'B','','C',''), ncol =2, align = "hv", rel_widths = c(1,0.33,1,0.33,1,0.33))
+p.tdd.flowering
+```
+
+
+
+
+
+
+
+## Reproductive success of Dryas octopetala in 2020 vs 2021 ##
+
+Here, we compare the number of Dryas flowers that set seed between 2020 and 2021. 
+
+```{r}
+#Rename some columns
+df_seed <- df_seed %>% rename(Flowers = "Total Dryas flowers per 50 x 50 cm plot", 
+       Seedset = "Dryas flowers with seed set")
+
+#Then, we should only select the plots that were both sampled in 2020 and 2021, plot 1 and 13 were moved and thus excluded
+list_both_years <- c("FINSE-00", "FINSE-02", "FINSE-03", "FINSE-04", "FINSE-05", "FINSE-06", "FINSE-07", "FINSE-08", "FINSE-09", "FINSE-10", "FINSE-11", "FINSE-12", "FINSE-14", "FINSE-15", "FINSE-16")
+
+df_seed <- df_seed %>% 
+  filter(Plot %in% list_both_years)
+
+#Now we can calculate the relative % of seeds that produced a seedhead (note that 2020 only 1 fully developed seedhead was formed)
+df_seed <- df_seed %>% 
+  mutate(rel_seedset = Seedset/Flowers * 100) %>% 
+  mutate_all(~replace(., is.nan(.), 0))#Replaces NaN (0/0) with a zero
+
+#Check assumptions and do paired t.test
+# compute the difference
+d <- with(df_seed, 
+          rel_seedset[Year == "2020"] - rel_seedset[Year == "2021"])
+# Shapiro-Wilk normality test for the differences
+shapiro.test(d) # => p-value = 0.1055 so that is OK!
+
+t.test(data = df_seed, rel_seedset ~ Year, paired = TRUE, alternative = "two.sided") #sign difference between the years
+
+
+#Do t.test for number of flowers
+d <- with(df_seed, 
+          Flowers[Year == "2020"] - Flowers[Year == "2021"])
+# Shapiro-Wilk normality test for the differences
+shapiro.test(d) # => p-value = 0.1275 so that is OK!
+
+t.test(data = df_seed, Flowers ~ Year, paired = TRUE, alternative = "two.sided") #sign difference between the years
+
+
+
+```
+Now we can make a figure for the pairwise comparison
+
+```{r}
+p_seedset <- df_seed %>% 
+  ggplot(aes(x = as.factor(Year), y = rel_seedset)) +
+  geom_boxplot() + 
+  geom_line(aes(group = Plot, color = Plot)) +
+  geom_point(aes(color = Plot)) +
+  labs(x = "Year", y = "Percentage seedset") +
+  scale_color_viridis(discrete = TRUE)+
+  theme_classic()
+
+
+#Check total number of flowers per year
+df_seed %>% 
+  group_by(Year) %>% 
+  summarize(mean = mean(Flowers), 
+            sd = sd(Flowers), 
+            se=sd/sqrt(n()))
+
+#plot total number of flowers per year
+p_flowers <- df_seed %>% 
+  ggplot(., aes(x  = as.factor(Year), y = Flowers)) + 
+  geom_boxplot() +
+  geom_point(aes(x = as.factor(Year), y = Flowers, color = Plot))+ 
+  geom_line(aes(x = as.factor(Year), y = Flowers, group = Plot, color = Plot)) +
+  labs(x = "Year", y = "Number of flowering units") +
+  scale_color_viridis(discrete = TRUE) + 
+  theme_classic()
+
+
+#combine plot
+p_flowers_seed <- plot_grid(
+  p_flowers + theme(legend.position="none"),
+  p_seedset + theme(legend.position="none"))
+legend <- get_legend(p_flowers + 
+                       guides(color = guide_legend(nrow = 3)) +
+                       theme(legend.position = "bottom"))
+
+
+plot_grid(p_flowers_seed, legend, ncol = 1, rel_heights = c(1, .25))
+```
+
+
